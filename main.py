@@ -1,11 +1,10 @@
-
 from fastapi import FastAPI, UploadFile, File, Form, Body, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from typing import Dict, Any
 import os, io, json, time, base64, uuid, pathlib
 import numpy as np
 import cv2
-from PIL import Image
+from PIL import Image, UnidentifiedImageError
 
 # ========================= Firebase Admin =========================
 import firebase_admin
@@ -64,7 +63,29 @@ def pil_to_bgr(img: Image.Image) -> np.ndarray:
     return cv2.cvtColor(np.array(img.convert("RGB")), cv2.COLOR_RGB2BGR)
 
 def read_upload_as_bgr(upload: UploadFile) -> np.ndarray:
-    return pil_to_bgr(Image.open(io.BytesIO(upload.file.read())))
+    """Decode any common image. Prefer PIL, then fallback to OpenCV.
+       Raises HTTP 415 for unsupported/invalid files instead of 500.
+    """
+    data = upload.file.read()
+    if not data:
+        raise HTTPException(status_code=400, detail="Empty file")
+
+    # 1) Try Pillow (handles jpg/png/webp if codecs are available)
+    try:
+        img = Image.open(io.BytesIO(data))
+        return pil_to_bgr(img)
+    except UnidentifiedImageError:
+        pass
+    except Exception:
+        # if PIL fails for other reasons, still try OpenCV
+        pass
+
+    # 2) Fallback to OpenCV decode
+    arr = np.frombuffer(data, dtype=np.uint8)
+    bgr = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+    if bgr is None:
+        raise HTTPException(status_code=415, detail="Unsupported or corrupted image format")
+    return bgr
 
 def auto_enhance(bgr: np.ndarray) -> np.ndarray:
     img = cv2.convertScaleAbs(bgr, alpha=1.05, beta=8)
@@ -114,6 +135,14 @@ def is_match(score: float) -> bool:
     if SIM_MEASURE == "cosine":
         return score >= COS_THRESHOLD
     return score <= L2_THRESHOLD
+
+def _embedding_from_rec(rec: dict) -> np.ndarray:
+    """Make sure embedding always becomes a float32 np.array."""
+    v = rec.get("embedding", [])
+    if isinstance(v, dict):
+        # Firebase can return dict like {"0":0.1,"1":0.2,...}; sort numeric keys
+        v = [v[k] for k in sorted(v.keys(), key=lambda x: int(x))]
+    return np.array(v, dtype="float32")
 
 # ========================= FastAPI app =========================
 app = FastAPI(title=APP_NAME, description="Register (phone) + Authenticate (ESP32-CAM)")
@@ -180,14 +209,20 @@ def register(username: str = Form(...), image: UploadFile = File(...)):
 
 # ---------------- Management ----------------
 @app.get("/users")
-def list_users(include_image: bool = False):
+def list_users():
+    """Return ALL users with username + image (and timestamps)."""
     data = users_ref().get() or {}
     out = []
     for u in data.values():
-        item = {k: u.get(k) for k in ("userId","username","createdAt","updatedAt")}
-        if include_image:
-            item["image_b64"] = u.get("image_b64")
-        out.append(item)
+        out.append({
+            "userId":   u.get("userId"),
+            "username": u.get("username"),
+            "image_b64": u.get("image_b64"),
+            "createdAt": u.get("createdAt"),
+            "updatedAt": u.get("updatedAt"),
+        })
+    # keep a stable order (by createdAt if present)
+    out.sort(key=lambda x: x.get("createdAt") or 0)
     return {"count": len(out), "users": out}
 
 @app.get("/users/{user_id}")
@@ -238,7 +273,7 @@ def authenticate(image: UploadFile = File(...)):
 
     best_user, best_score = None, (-1e9 if SIM_MEASURE=="cosine" else 1e9)
     for rec in data.values():
-        v = np.array(rec.get("embedding", []), dtype="float32")
+        v = _embedding_from_rec(rec)
         if v.size == 0:
             continue
         sc = compare(feat, v)
